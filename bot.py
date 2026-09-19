@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -37,7 +37,7 @@ UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # secondes
 
 START_TIME = time.time()
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.0.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -3369,6 +3369,7 @@ def update_embed(remote: Optional[str]) -> discord.Embed:
     emb.add_field(name="Version actuelle", value=f"`{BOT_VERSION}`", inline=True)
     emb.add_field(name="Version distante", value=f"`{remote or 'N/A'}`", inline=True)
     emb.add_field(name="Vérif auto", value="ON" if UPDATE_ENABLED else "OFF", inline=True)
+    emb.add_field(name="URL lue", value=f"`{UPDATE_VERSION_URL or 'vide'}`", inline=False)
     if remote and parse_version(remote) > parse_version(BOT_VERSION):
         emb.color = 0x57F287
         emb.description = f"**Nouvelle version disponible**\n`{BOT_VERSION}` → **`{remote}`**\n\nVeux-tu installer la mise à jour ?"

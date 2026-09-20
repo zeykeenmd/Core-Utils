@@ -1899,7 +1899,7 @@ async def on_ready():
         ("Propriétaire", ["owner", "unowner", "help", "debug", "restart", "status", "servers"]),
         ("Modération", ["kick", "ban", "unban", "mute", "unmute", "bl", "unbl"]),
         ("Serveur", ["setup", "welcome", "boost", "annonce", "nuke", "giverole"]),
-        ("Tickets", ["ticket", "claim", "add", "remove"]),
+        ("Tickets", ["ticket", "claim", "add", "remove", "close", "reopen"]),
         ("Niveaux", ["levels", "rank", "top", "addxp"]),
     ]
     loaded = 0

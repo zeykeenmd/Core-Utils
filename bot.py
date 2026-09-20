@@ -36,10 +36,13 @@ UPDATE_ENABLED = os.getenv("UPDATE_ENABLED", "0").strip() in ("1", "true", "True
 UPDATE_AUTO_INSTALL = os.getenv("UPDATE_AUTO_INSTALL", "0").strip() in ("1", "true", "True", "yes")
 UPDATE_VERSION_URL = os.getenv("UPDATE_VERSION_URL", "").strip()
 UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # secondes
+try:
+    UPDATE_INTERVAL = max(5, int(os.getenv("UPDATE_INTERVAL", "300")))  # minimum 5 secondes
+except Exception:
+    UPDATE_INTERVAL = 300
 
 START_TIME = time.time()
-BOT_VERSION = "2.1.1"
+BOT_VERSION = "2.1.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -337,12 +340,34 @@ def set_guild(guild_id: Optional[int]):
 
 def get_config(guild_id: Optional[int] = None) -> dict:
     data = load_json(guild_file("config.json", guild_id), DEFAULT_CONFIG.copy())
+    if not isinstance(data, dict):
+        data = DEFAULT_CONFIG.copy()
     for k, v in DEFAULT_CONFIG.items():
         data.setdefault(k, v)
+    # Normalise les IDs numériques souvent stockés en str
+    for key in (
+        "TICKET_CATEGORY_ID", "LOG_CHANNEL_ID", "TICKET_LOG_CHANNEL_ID",
+        "STAFF_ROLE_ID", "AUTOROLE_ID", "WELCOME_CHANNEL_ID", "BOOST_CHANNEL_ID",
+    ):
+        if data.get(key) not in (None, "", 0, "0"):
+            try:
+                data[key] = int(data[key])
+            except Exception:
+                pass
     return data
 
 def save_config(data: dict, guild_id: Optional[int] = None):
-    save_json(guild_file("config.json", guild_id), data)
+    if not isinstance(data, dict):
+        data = DEFAULT_CONFIG.copy()
+    # Toujours écrire un int pour la catégorie tickets
+    if data.get("TICKET_CATEGORY_ID") not in (None, "", 0, "0"):
+        try:
+            data["TICKET_CATEGORY_ID"] = int(data["TICKET_CATEGORY_ID"])
+        except Exception:
+            pass
+    path = guild_file("config.json", guild_id)
+    save_json(path, data)
+    print(f"[CONFIG] save → {path} TICKET_CATEGORY_ID={data.get('TICKET_CATEGORY_ID')}")
 
 def get_mod_memory(guild_id: Optional[int] = None) -> dict:
     return load_json(guild_file("moderation.json", guild_id), {"bans": [], "kicks": [], "mutes": [], "roles": []})
@@ -487,11 +512,50 @@ def find_ticket_by_channel(channel_id: int):
 
 
 def can_manage_ticket(user_id: int, data: dict) -> bool:
+    """Owners peuvent toujours gérer. Sinon claimer / staff ajouté."""
+    if is_owner(user_id):
+        return True
     claimed_by = data.get("claimed_by")
-    staff_list = data.get("staff", [])
+    staff_list = [int(x) for x in (data.get("staff") or [])]
     if not claimed_by:
-        return is_owner(user_id)
+        return True
+    try:
+        claimed_by = int(claimed_by)
+    except Exception:
+        pass
     return user_id == claimed_by or user_id in staff_list
+
+def gen_ticket_id(tickets: dict = None) -> str:
+    existing = set()
+    if tickets:
+        for d in tickets.values():
+            if isinstance(d, dict) and d.get("ticket_id"):
+                existing.add(str(d["ticket_id"]).upper())
+    for _ in range(30):
+        tid = "T-" + secrets.token_hex(2).upper()
+        if tid not in existing:
+            return tid
+    return "T-" + secrets.token_hex(3).upper()
+
+def find_ticket_entry(query: str, guild_id: Optional[int] = None) -> tuple:
+    """Retourne (user_key, data, guild_id) ou (None, None, None)."""
+    q = (query or "").strip()
+    if not q:
+        return None, None, None
+    guilds = [guild_id] if guild_id else [g.id for g in bot.guilds]
+    for gid in guilds:
+        tickets = get_tickets(gid)
+        # par ID ticket
+        for ukey, data in tickets.items():
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("ticket_id", "")).upper() == q.upper():
+                return ukey, data, gid
+            if ukey == q or str(data.get("user_id")) == q:
+                return ukey, data, gid
+            if str(data.get("channel_id")) == q:
+                return ukey, data, gid
+    return None, None, None
 
 
 async def send_transcript(user: discord.User, closer_name: str, messages_list: list):
@@ -517,21 +581,33 @@ async def send_transcript(user: discord.User, closer_name: str, messages_list: l
         pass
 
 
-async def close_ticket(user_id: str, closer, channel=None):
-    gid = None
+async def close_ticket(user_id: str, closer, channel=None, guild_id: Optional[int] = None):
+    gid = guild_id
     if channel is not None and getattr(channel, "guild", None):
         gid = channel.guild.id
         set_guild(gid)
+    if gid:
+        set_guild(gid)
     tickets = get_tickets(gid)
     if user_id not in tickets:
-        return False
+        # fallback : chercher partout
+        ukey, data, found_gid = find_ticket_entry(str(user_id), None)
+        if not ukey:
+            return False
+        user_id, gid = ukey, found_gid
+        tickets = get_tickets(gid)
     data = tickets[user_id]
+    tid = data.get("ticket_id") or user_id
     tickets[user_id]["closed"] = True
+    tickets[user_id]["closed_at"] = discord.utils.utcnow().isoformat()
+    tickets[user_id]["closed_by"] = getattr(closer, "id", None)
+    # garde l'historique pour +reopen
     save_tickets(tickets, gid)
     try:
-        user = await bot.fetch_user(int(user_id))
+        user = await bot.fetch_user(int(data.get("user_id") or user_id))
         await user.send(
-            "Votre ticket a été fermé. Si vous pensez que cela est une erreur, veuillez envoyer à nouveau un message au support."
+            f"Votre ticket **`{tid}`** a été fermé. "
+            "Si vous pensez que cela est une erreur, veuillez envoyer à nouveau un message au support."
         )
         try:
             view = discord.ui.View(timeout=180)
@@ -554,10 +630,21 @@ async def close_ticket(user_id: str, closer, channel=None):
             pass
     except Exception:
         pass
-    target = channel or bot.get_channel(data.get("channel_id") or 0)
+    target = channel
+    if target is None and data.get("channel_id"):
+        target = bot.get_channel(int(data["channel_id"]))
+        if target is None:
+            try:
+                target = await bot.fetch_channel(int(data["channel_id"]))
+            except Exception:
+                target = None
     if target:
         try:
-            await target.delete(reason=f"Ticket fermé par {closer}")
+            await target.send(f"Ticket `{tid}` fermé par {closer.mention}. Suppression du salon…")
+        except Exception:
+            pass
+        try:
+            await target.delete(reason=f"Ticket {tid} fermé par {closer}")
         except Exception:
             pass
     return True
@@ -1419,19 +1506,28 @@ class SetupView(discord.ui.View):
     )
     async def pick_category(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         category = select.values[0]
-        gid = self._gid(interaction)
+        gid = self._gid(interaction) or (interaction.guild.id if interaction.guild else None)
+        if gid is None:
+            await interaction.response.send_message("Serveur introuvable.", ephemeral=True)
+            return
         config = get_config(gid)
-        config["TICKET_CATEGORY_ID"] = category.id
+        config["TICKET_CATEGORY_ID"] = int(category.id)
         save_config(config, gid)
-        # miroir global pour les tickets en MP
+        # miroir global + confirm
         try:
             glob = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
-            glob["TICKET_CATEGORY_ID"] = category.id
+            glob["TICKET_CATEGORY_ID"] = int(category.id)
             save_json(CONFIG_FILE, glob)
         except Exception:
             pass
+        print(f"[SETUP] Catégorie tickets={category.id} guild={gid}")
         try:
-            cat_obj = interaction.guild.get_channel(category.id)
+            cat_obj = interaction.guild.get_channel(int(category.id)) if interaction.guild else None
+            if cat_obj is None and interaction.guild:
+                try:
+                    cat_obj = await bot.fetch_channel(int(category.id))
+                except Exception:
+                    cat_obj = None
             if isinstance(cat_obj, discord.CategoryChannel):
                 await cat_obj.set_permissions(interaction.guild.default_role, view_channel=False)
                 await cat_obj.set_permissions(interaction.guild.me, view_channel=True, manage_channels=True)
@@ -1444,8 +1540,8 @@ class SetupView(discord.ui.View):
                     m = interaction.guild.get_member(oid)
                     if m:
                         await cat_obj.set_permissions(m, view_channel=True)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SETUP] perms catégorie: {e}")
         await interaction.response.edit_message(embed=setup_embed(gid), view=SetupView(self.author_id, gid))
 
     @discord.ui.select(
@@ -1612,7 +1708,11 @@ class RolePermsView(discord.ui.View):
 class TicketView(discord.ui.View):
     def __init__(self, user_id: str):
         super().__init__(timeout=None)
-        self.user_id = user_id
+        self.user_id = str(user_id)
+        if len(self.children) >= 1:
+            self.children[0].custom_id = f"ticket_claim:{self.user_id}"
+        if len(self.children) >= 2:
+            self.children[1].custom_id = f"ticket_close:{self.user_id}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not is_owner(interaction.user.id):
@@ -1622,9 +1722,10 @@ class TicketView(discord.ui.View):
 
     @discord.ui.button(label="🙋 Claim", style=discord.ButtonStyle.primary, custom_id="ticket_claim")
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild:
-            set_guild(interaction.guild.id)
-        tickets = get_tickets(interaction.guild.id if interaction.guild else None)
+        gid = interaction.guild.id if interaction.guild else None
+        if gid:
+            set_guild(gid)
+        tickets = get_tickets(gid)
         if self.user_id not in tickets or tickets[self.user_id].get("closed"):
             await interaction.response.send_message("❌ Ticket introuvable ou fermé.", ephemeral=True)
             return
@@ -1635,64 +1736,92 @@ class TicketView(discord.ui.View):
             return
 
         tickets[self.user_id]["claimed_by"] = interaction.user.id
-        tickets[self.user_id]["staff"] = [interaction.user.id]
-        save_tickets(tickets, interaction.guild.id if interaction.guild else None)
+        staff = [int(x) for x in (tickets[self.user_id].get("staff") or [])]
+        if interaction.user.id not in staff:
+            staff.append(interaction.user.id)
+        tickets[self.user_id]["staff"] = staff
+        save_tickets(tickets, gid)
 
+        tid = tickets[self.user_id].get("ticket_id") or self.user_id
         try:
-            await interaction.channel.edit(name=f"claimed-{interaction.user.name.lower()[:12]}")
+            await interaction.channel.edit(name=f"claimed-{str(tid).lower()}-{interaction.user.name.lower()[:10]}"[:90])
         except Exception:
             pass
 
+        # Ajoute le claimer SANS retirer owners / staff
         try:
-            overwrites = {
-                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
-                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
-            }
-            await interaction.channel.edit(overwrites=overwrites)
+            await interaction.channel.set_permissions(
+                interaction.user,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            )
         except Exception:
             pass
 
-        await interaction.response.send_message(f"✅ Ticket claim par {interaction.user.mention}", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Ticket **`{tid}`** claim par {interaction.user.mention}",
+            ephemeral=False,
+        )
 
     @discord.ui.button(label="🔒 Fermer", style=discord.ButtonStyle.danger, custom_id="ticket_close")
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        tickets = get_tickets()
+        gid = interaction.guild.id if interaction.guild else None
+        if gid:
+            set_guild(gid)
+        tickets = get_tickets(gid)
         if self.user_id not in tickets:
-            await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
-            return
+            # fallback recherche
+            ukey, data, found = find_ticket_entry(self.user_id, gid)
+            if not ukey:
+                await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
+                return
+            self.user_id = ukey
+            gid = found
+            tickets = get_tickets(gid)
 
         data = tickets[self.user_id]
-        claimed_by = data.get("claimed_by")
-        staff_list = data.get("staff", [])
-
-        if claimed_by and interaction.user.id not in staff_list and interaction.user.id != claimed_by:
-            await interaction.response.send_message("❌ Seul le staff qui a claim (ou ajouté) peut fermer ce ticket.", ephemeral=True)
+        if not can_manage_ticket(interaction.user.id, data):
+            await interaction.response.send_message(
+                "❌ Tu ne peux pas fermer ce ticket (claim requis, sauf owners).",
+                ephemeral=True,
+            )
             return
 
-        view = ConfirmCloseView(self.user_id, interaction.user)
-        await interaction.response.send_message("⚠️ Es-tu sûr de vouloir **fermer** ce ticket ?\nLe salon sera **supprimé**.", view=view, ephemeral=True)
+        tid = data.get("ticket_id") or self.user_id
+        view = ConfirmCloseView(self.user_id, interaction.user, gid)
+        await interaction.response.send_message(
+            f"⚠️ Fermer le ticket **`{tid}`** ?\nLe salon sera **supprimé** (réouvrable avec `+reopen {tid}`).",
+            view=view,
+            ephemeral=True,
+        )
 
 
 class ConfirmCloseView(discord.ui.View):
-    def __init__(self, user_id: str, closer: discord.Member):
-        super().__init__(timeout=30)
-        self.user_id = user_id
+    def __init__(self, user_id: str, closer: discord.Member, guild_id: Optional[int] = None):
+        super().__init__(timeout=60)
+        self.user_id = str(user_id)
         self.closer = closer
+        self.guild_id = guild_id
 
     @discord.ui.button(label="Oui, fermer", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.closer.id:
             await interaction.response.send_message("❌ Seule la personne qui a demandé peut confirmer.", ephemeral=True)
             return
-
-        tickets = get_tickets()
+        gid = self.guild_id or (interaction.guild.id if interaction.guild else None)
+        if gid:
+            set_guild(gid)
+        tickets = get_tickets(gid)
         if self.user_id not in tickets:
             await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
             return
-
-        await interaction.response.edit_message(content="✅ Ticket fermé. Salon en cours de suppression...", view=None)
-        await close_ticket(self.user_id, self.closer, interaction.channel)
+        tid = tickets[self.user_id].get("ticket_id") or self.user_id
+        await interaction.response.edit_message(
+            content=f"✅ Ticket **`{tid}`** fermé. Salon en suppression…",
+            view=None,
+        )
+        await close_ticket(self.user_id, self.closer, interaction.channel, guild_id=gid)
 
     @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2556,13 +2685,13 @@ async def on_message(message: discord.Message):
                 return
 
     if message.guild is None or isinstance(message.channel, discord.DMChannel):
-        # Résoudre le serveur + catégorie depuis la config PAR SERVEUR (data/guilds/<id>/)
+        # ----- Tickets MP : trouver serveur + catégorie -----
         guild = None
         category = None
         config = None
 
         async def resolve_category(g: discord.Guild, cid) -> Optional[discord.CategoryChannel]:
-            if not cid:
+            if cid in (None, "", 0, "0"):
                 return None
             try:
                 cid = int(cid)
@@ -2572,84 +2701,99 @@ async def on_message(message: discord.Message):
             if raw is None:
                 try:
                     raw = await bot.fetch_channel(cid)
-                except Exception:
+                except Exception as e:
+                    print(f"[TICKET] fetch_channel({cid}) fail: {e}")
                     return None
-            if isinstance(raw, discord.CategoryChannel) and raw.guild and raw.guild.id == g.id:
+            if isinstance(raw, discord.CategoryChannel):
+                if raw.guild and raw.guild.id != g.id:
+                    return None
                 return raw
-            if raw is not None and getattr(raw, "category", None) and raw.guild and raw.guild.id == g.id:
+            # ID d'un salon → prendre sa catégorie parente
+            if getattr(raw, "category", None) is not None:
                 return raw.category
             return None
 
-        # 1) Config de chaque serveur où le bot est
+        # Logs debug configs
+        for g in bot.guilds:
+            cfg = get_config(g.id)
+            print(f"[TICKET] scan guild={g.name} ({g.id}) TICKET_CATEGORY_ID={cfg.get('TICKET_CATEGORY_ID')}")
+
+        # 1) Premier serveur avec une catégorie tickets valide
         for g in bot.guilds:
             cfg = get_config(g.id)
             cat = await resolve_category(g, cfg.get("TICKET_CATEGORY_ID"))
             if cat is not None:
-                guild = g
-                category = cat
-                config = cfg
+                guild, category, config = g, cat, cfg
                 break
 
-        # 2) Config globale legacy data/config.json
+        # 2) Config globale data/config.json
         if guild is None:
-            cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
+            try:
+                glob = load_json(CONFIG_FILE, {})
+                for g in bot.guilds:
+                    cat = await resolve_category(g, glob.get("TICKET_CATEGORY_ID"))
+                    if cat is not None:
+                        guild, category = g, cat
+                        config = get_config(g.id)
+                        config["TICKET_CATEGORY_ID"] = int(cat.id)
+                        save_config(config, g.id)
+                        break
+            except Exception as e:
+                print(f"[TICKET] global config: {e}")
+
+        # 3) Serveur où l'utilisateur est membre
+        if guild is None:
             for g in bot.guilds:
-                cat = await resolve_category(g, cfg.get("TICKET_CATEGORY_ID"))
-                if cat is not None:
+                m = g.get_member(message.author.id)
+                if m is None:
+                    try:
+                        m = await g.fetch_member(message.author.id)
+                    except Exception:
+                        m = None
+                if m is not None:
                     guild = g
-                    category = cat
                     config = get_config(g.id)
-                    config["TICKET_CATEGORY_ID"] = cat.id
-                    save_config(config, g.id)
                     break
 
-        # 3) Dernier recours : serveur où le membre est présent
-        if guild is None:
-            for g in bot.guilds:
-                if g.get_member(message.author.id):
-                    guild = g
-                    config = get_config(g.id)
-                    break
-            if guild is None and bot.guilds:
-                guild = bot.guilds[0]
-                config = get_config(guild.id)
+        # 4) N'importe quel serveur du bot
+        if guild is None and bot.guilds:
+            guild = bot.guilds[0]
+            config = get_config(guild.id)
 
         if guild is None:
-            await message.channel.send("❌ Bot non présent sur un serveur.")
+            await message.channel.send("❌ Le bot n'est présent sur aucun serveur.")
             return
 
         set_guild(guild.id)
         if config is None:
             config = get_config(guild.id)
 
-        # Catégorie absente / invalide → créer ou récupérer "tickets"
+        # Catégorie manquante → récupérer / créer, mais NE PAS bloquer le ticket
+        if category is None:
+            cid = config.get("TICKET_CATEGORY_ID")
+            category = await resolve_category(guild, cid)
         if category is None:
             category = discord.utils.get(guild.categories, name="tickets")
-            if category is None:
-                try:
-                    category = await guild.create_category("tickets", reason="Catégorie tickets auto")
-                except Exception as e:
-                    print(f"[TICKET] Impossible de créer la catégorie: {e}")
-                    category = None
-            if category is not None:
-                config["TICKET_CATEGORY_ID"] = category.id
-                save_config(config, guild.id)
-                # miroir global pour compat
-                try:
-                    glob = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
-                    glob["TICKET_CATEGORY_ID"] = category.id
-                    save_json(CONFIG_FILE, glob)
-                except Exception:
-                    pass
+        if category is None:
+            try:
+                category = await guild.create_category("tickets", reason="Tickets auto")
+                print(f"[TICKET] Catégorie créée: {category.id}")
+            except Exception as e:
+                print(f"[TICKET] Création catégorie impossible: {e}")
+                category = None
+        if category is not None:
+            config["TICKET_CATEGORY_ID"] = int(category.id)
+            save_config(config, guild.id)
+            try:
+                glob = load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
+                glob["TICKET_CATEGORY_ID"] = int(category.id)
+                save_json(CONFIG_FILE, glob)
+            except Exception:
+                pass
 
-        if category is None and not config.get("TICKET_CATEGORY_ID"):
-            await message.channel.send(
-                "Les tickets ne sont pas configurés sur un serveur.\n"
-                "Un owner doit faire `+setup` sur le **bon serveur** et choisir la **catégorie tickets**."
-            )
-            return
-
+        # Plus de message "non configuré" bloquant : on crée le salon même sans catégorie
         tickets = get_tickets(guild.id)
+        print(f"[TICKET] MP de {message.author} → guild={guild.name} cat={getattr(category, 'id', None)}")
         user_id = str(message.author.id)
         try:
             await message.add_reaction("✉️")
@@ -2735,7 +2879,9 @@ async def on_message(message: discord.Message):
                 )
                 return
 
+            new_tid = gen_ticket_id(tickets)
             tickets[user_id] = {
+                "ticket_id": new_tid,
                 "user_id": message.author.id,
                 "username": str(message.author),
                 "channel_id": ticket_channel.id,
@@ -2750,20 +2896,27 @@ async def on_message(message: discord.Message):
                 }],
             }
             save_tickets(tickets, guild.id)
+            try:
+                await ticket_channel.edit(name=f"ticket-{new_tid.lower()}"[:90])
+            except Exception:
+                pass
 
-            info = discord.Embed(title="🎫 Nouveau Ticket", color=0x57F287, timestamp=discord.utils.utcnow())
+            info = discord.Embed(title=f"🎫 Ticket `{new_tid}`", color=0x57F287, timestamp=discord.utils.utcnow())
             info.set_thumbnail(url=message.author.display_avatar.url)
+            info.add_field(name="ID", value=f"`{new_tid}`", inline=True)
             info.add_field(name="Utilisateur", value=f"{message.author.mention}\n`{message.author.id}`", inline=True)
             info.add_field(name="Compte créé", value=discord.utils.format_dt(message.author.created_at, "R"), inline=True)
             info.add_field(name="Serveur", value=guild.name, inline=True)
             info.add_field(name="Message", value=message.content[:1000] or "*vide*", inline=False)
-            info.set_footer(text="Répondez ici • Claim pour prendre en charge")
+            info.set_footer(text=f"Claim / Fermer • +close {new_tid} • +reopen {new_tid}")
 
             await ticket_channel.send(embed=info, view=TicketView(user_id))
+            bot.add_view(TicketView(user_id))
             await ticket_channel.send(f"**{message.author.display_name}** : {message.content}")
-            print(f"[TICKET] Salon créé: {ticket_channel.name} ({ticket_channel.id}) sur {guild.name} cat={getattr(category,'id',None)}")
+            print(f"[TICKET] {new_tid} salon={ticket_channel.id} guild={guild.name}")
             await message.channel.send(
-                "Merci pour votre message , un(e) membre du staff reviendras vers vous très vite"
+                f"Merci pour votre message , un(e) membre du staff reviendras vers vous très vite\n"
+                f"ID du ticket : **`{new_tid}`**"
             )
         else:
             channel_id = tickets[user_id].get("channel_id")
@@ -3653,16 +3806,25 @@ async def notify_update_available(remote: str):
     mark_version_notified(remote)
     print(f"[UPDATE] Notification maj {BOT_VERSION} -> {remote} (salon logs)")
 
-@tasks.loop(seconds=max(60, UPDATE_INTERVAL))
+@tasks.loop(seconds=5)
 async def update_check_loop():
+    """Scan GitHub : ne redémarre QUE si version distante > version locale."""
     if not UPDATE_ENABLED or not UPDATE_VERSION_URL:
         return
+    # Respecte UPDATE_INTERVAL (défaut 300, min 5)
+    now = time.time()
+    last = getattr(update_check_loop, "_last_check", 0)
+    if now - last < UPDATE_INTERVAL:
+        return
+    update_check_loop._last_check = now
+
     remote = await fetch_remote_version()
     if not remote:
         return
+    # Pas de maj → rien (pas de restart)
     if parse_version(remote) <= parse_version(BOT_VERSION):
         return
-    # Installation automatique sans confirmation
+
     if UPDATE_AUTO_INSTALL and UPDATE_CODE_URL:
         if is_version_notified(remote):
             return
@@ -3677,7 +3839,7 @@ async def update_check_loop():
                     await ch.send(
                         embed=discord.Embed(
                             title="Mise à jour automatique",
-                            description=f"`{BOT_VERSION}` → **`{remote}`**\nTéléchargement et redémarrage en cours…",
+                            description=f"`{BOT_VERSION}` → **`{remote}`**\nTéléchargement et redémarrage…",
                             color=0x57F287,
                             timestamp=discord.utils.utcnow(),
                         )
@@ -3686,7 +3848,7 @@ async def update_check_loop():
             pass
         await apply_update_and_restart(reason=f"auto {BOT_VERSION}->{remote}", remote=remote)
         return
-    # Mode manuel : demander confirmation
+
     if is_version_notified(remote):
         return
     print(f"[UPDATE] Nouvelle version : {remote} (locale {BOT_VERSION}) — demande confirmation")
@@ -4505,6 +4667,143 @@ async def giveclaim_cmd(ctx: commands.Context, raw: str = None):
 @bot.command(name="claim")
 async def claim_cmd(ctx: commands.Context):
     await ctx.send("Le claim se fait avec le bouton **Claim** dans le ticket. Pour transférer : `+giveclaim @staff`")
+
+@bot.command(name="close", aliases=["fclose", "ticketclose"])
+async def close_cmd(ctx: commands.Context, ticket_ref: str = None):
+    """Ferme un ticket : +close | +close T-A1B2 | dans le salon ticket."""
+    if not await owner_check(ctx):
+        return
+    gid = ctx.guild.id if ctx.guild else None
+    ukey, data, found_gid = None, None, None
+    if ticket_ref:
+        ukey, data, found_gid = find_ticket_entry(ticket_ref, gid)
+        if not ukey:
+            ukey, data, found_gid = find_ticket_entry(ticket_ref, None)
+    elif ctx.guild:
+        tickets = get_tickets(ctx.guild.id)
+        for k, d in tickets.items():
+            if d.get("channel_id") == ctx.channel.id and not d.get("closed"):
+                ukey, data, found_gid = k, d, ctx.guild.id
+                break
+    if not ukey or not data:
+        await ctx.send("Usage : `+close` (dans le ticket) ou `+close T-XXXX`")
+        return
+    if data.get("closed"):
+        await ctx.send(f"Ticket **`{data.get('ticket_id', ukey)}`** déjà fermé. `+reopen {data.get('ticket_id', ukey)}`")
+        return
+    if not can_manage_ticket(ctx.author.id, data):
+        await ctx.send("❌ Tu ne peux pas fermer ce ticket.")
+        return
+    tid = data.get("ticket_id") or ukey
+    await ctx.send(f"Fermeture de **`{tid}`**…")
+    ch = ctx.channel if data.get("channel_id") == getattr(ctx.channel, "id", None) else bot.get_channel(int(data.get("channel_id") or 0))
+    ok = await close_ticket(ukey, ctx.author, ch, guild_id=found_gid)
+    if not ch:
+        await ctx.send(f"{'✅' if ok else '❌'} Ticket **`{tid}`** fermé (salon déjà absent).")
+
+@bot.command(name="reopen", aliases=["réopen", "reouvre", "ticketreopen"])
+async def reopen_cmd(ctx: commands.Context, ticket_ref: str = None):
+    """Réouvre un ticket fermé : +reopen T-XXXX"""
+    if not await owner_check(ctx):
+        return
+    if not ticket_ref:
+        await ctx.send("Usage : `+reopen T-XXXX`")
+        return
+    ukey, data, found_gid = find_ticket_entry(ticket_ref, ctx.guild.id if ctx.guild else None)
+    if not ukey:
+        ukey, data, found_gid = find_ticket_entry(ticket_ref, None)
+    if not ukey or not data:
+        await ctx.send(f"Ticket **`{ticket_ref}`** introuvable.")
+        return
+    tid = data.get("ticket_id") or ukey
+    if not data.get("closed"):
+        await ctx.send(f"Ticket **`{tid}`** est déjà ouvert.")
+        return
+    guild = bot.get_guild(int(found_gid or data.get("guild_id") or 0))
+    if guild is None and ctx.guild:
+        guild = ctx.guild
+        found_gid = ctx.guild.id
+    if guild is None:
+        await ctx.send("Serveur du ticket introuvable.")
+        return
+    set_guild(guild.id)
+    config = get_config(guild.id)
+    category = None
+    if config.get("TICKET_CATEGORY_ID"):
+        category = guild.get_channel(int(config["TICKET_CATEGORY_ID"]))
+        if not isinstance(category, discord.CategoryChannel):
+            category = getattr(category, "category", None)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    for oid in get_owners() + get_ownerplus():
+        m = guild.get_member(oid)
+        if m:
+            overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    staff_id = config.get("STAFF_ROLE_ID")
+    if staff_id:
+        sr = guild.get_role(int(staff_id))
+        if sr:
+            overwrites[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    try:
+        new_ch = await guild.create_text_channel(
+            name=f"ticket-{str(tid).lower()}"[:90],
+            overwrites=overwrites,
+            category=category if isinstance(category, discord.CategoryChannel) else None,
+            topic=f"Ticket {tid} réouvert — user {data.get('user_id')}",
+        )
+    except Exception as e:
+        await ctx.send(f"Impossible de recréer le salon : `{e}`")
+        return
+    tickets = get_tickets(guild.id)
+    if ukey not in tickets:
+        tickets[ukey] = data
+    tickets[ukey]["closed"] = False
+    tickets[ukey]["channel_id"] = new_ch.id
+    tickets[ukey]["guild_id"] = guild.id
+    tickets[ukey]["reopened_at"] = discord.utils.utcnow().isoformat()
+    tickets[ukey]["claimed_by"] = None
+    tickets[ukey]["staff"] = []
+    save_tickets(tickets, guild.id)
+    emb = discord.Embed(title=f"Ticket `{tid}` réouvert", color=0x57F287, timestamp=discord.utils.utcnow())
+    emb.add_field(name="Utilisateur", value=f"<@{data.get('user_id')}>", inline=True)
+    emb.add_field(name="Par", value=ctx.author.mention, inline=True)
+    await new_ch.send(embed=emb, view=TicketView(ukey))
+    bot.add_view(TicketView(ukey))
+    try:
+        u = await bot.fetch_user(int(data.get("user_id")))
+        await u.send(f"Votre ticket **`{tid}`** a été **réouvert**. Vous pouvez à nouveau écrire au bot.")
+    except Exception:
+        pass
+    await ctx.send(f"✅ Ticket **`{tid}`** réouvert → {new_ch.mention}")
+
+@bot.command(name="ticketinfo", aliases=["tinfo"])
+async def ticketinfo_cmd(ctx: commands.Context, ticket_ref: str = None):
+    if not await owner_check(ctx):
+        return
+    if not ticket_ref and ctx.guild:
+        tickets = get_tickets(ctx.guild.id)
+        for k, d in tickets.items():
+            if d.get("channel_id") == ctx.channel.id:
+                ticket_ref = d.get("ticket_id") or k
+                break
+    if not ticket_ref:
+        await ctx.send("`+ticketinfo T-XXXX`")
+        return
+    ukey, data, gid = find_ticket_entry(ticket_ref, ctx.guild.id if ctx.guild else None)
+    if not data:
+        ukey, data, gid = find_ticket_entry(ticket_ref, None)
+    if not data:
+        await ctx.send("Introuvable.")
+        return
+    emb = discord.Embed(title=f"Ticket `{data.get('ticket_id', ukey)}`", color=0x5865F2)
+    emb.add_field(name="User", value=f"<@{data.get('user_id')}> (`{data.get('user_id')}`)", inline=False)
+    emb.add_field(name="État", value="Fermé" if data.get("closed") else "Ouvert", inline=True)
+    emb.add_field(name="Claim", value=f"<@{data['claimed_by']}>" if data.get("claimed_by") else "—", inline=True)
+    emb.add_field(name="Salon", value=f"`{data.get('channel_id')}`", inline=True)
+    emb.add_field(name="Créé", value=str(data.get("created_at", "?"))[:19], inline=True)
+    await ctx.send(embed=emb)
     return
     tickets = get_tickets()
     found = None

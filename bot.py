@@ -33,12 +33,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
 DBRESET_ENABLED = False
 UPDATE_ENABLED = os.getenv("UPDATE_ENABLED", "0").strip() in ("1", "true", "True", "yes")
+UPDATE_AUTO_INSTALL = os.getenv("UPDATE_AUTO_INSTALL",  "0",).strip() in ("1", "true", "True", "yes")
 UPDATE_VERSION_URL = os.getenv("UPDATE_VERSION_URL", "").strip()
 UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # secondes
 
 START_TIME = time.time()
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.0.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -3503,9 +3504,32 @@ async def update_check_loop():
         return
     if parse_version(remote) <= parse_version(BOT_VERSION):
         return
+
+    if UPDATE_AUTO_INSTALL and UPDATE_CODE_URL:
+        if is_version_notified(remote):
+            return
+        mark_version_notified(remote)
+        print(f"[UPDATE] AUTO-INSTALL {BOT_VERSION} → {remote}")
+        try:
+            cfg = get_config()
+            ch_id = cfg.get("LOG_CHANNEL_ID")
+            if ch_id:
+                ch = bot.get_channel(int(ch_id))
+                if ch:
+                    await ch.send(
+                        embed=discord.Embed(
+                            title="Mise à jour automatique",
+                            description=f"`{BOT_VERSION}` → **`{remote}`**\nTéléchargement et redémarrage…",
+                            color=0x57F287,
+                        )
+                    )
+        except Exception:
+            pass
+        await apply_update_and_restart(reason=f"auto {BOT_VERSION}->{remote}", remote=remote)
+        return
+
     if is_version_notified(remote):
         return
-    print(f"[UPDATE] Nouvelle version : {remote} (locale {BOT_VERSION}) — demande confirmation")
     await notify_update_available(remote)
 
 @update_check_loop.before_loop

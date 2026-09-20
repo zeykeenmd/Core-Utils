@@ -39,7 +39,7 @@ UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # secondes
 
 START_TIME = time.time()
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.1.1"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)

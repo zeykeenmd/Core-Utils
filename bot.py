@@ -6,7 +6,7 @@ import random
 import re
 import platform
 import time
-import sqlite32
+import sqlite3
 import hashlib
 import secrets
 import hmac

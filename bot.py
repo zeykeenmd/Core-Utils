@@ -34,7 +34,7 @@ BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
 DBRESET_ENABLED = False
 UPDATE_ENABLED = os.getenv("UPDATE_ENABLED", "0").strip() in ("1", "true", "True", "yes")
 UPDATE_AUTO_INSTALL = os.getenv("UPDATE_AUTO_INSTALL", "0").strip() in ("1", "true", "True", "yes")
-# Détecte toute modification du bot.py GitHub (même sans changer version.txt)
+
 UPDATE_DETECT_HASH = os.getenv("UPDATE_DETECT_HASH", "1").strip() in ("1", "true", "True", "yes")
 UPDATE_VERSION_URL = os.getenv("UPDATE_VERSION_URL", "").strip()
 UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
@@ -346,7 +346,7 @@ def get_config(guild_id: Optional[int] = None) -> dict:
         data = DEFAULT_CONFIG.copy()
     for k, v in DEFAULT_CONFIG.items():
         data.setdefault(k, v)
-    # Normalise les IDs numériques souvent stockés en str
+  
     for key in (
         "TICKET_CATEGORY_ID", "LOG_CHANNEL_ID", "TICKET_LOG_CHANNEL_ID",
         "STAFF_ROLE_ID", "AUTOROLE_ID", "WELCOME_CHANNEL_ID", "BOOST_CHANNEL_ID",
@@ -361,7 +361,7 @@ def get_config(guild_id: Optional[int] = None) -> dict:
 def save_config(data: dict, guild_id: Optional[int] = None):
     if not isinstance(data, dict):
         data = DEFAULT_CONFIG.copy()
-    # Toujours écrire un int pour la catégorie tickets
+   
     if data.get("TICKET_CATEGORY_ID") not in (None, "", 0, "0"):
         try:
             data["TICKET_CATEGORY_ID"] = int(data["TICKET_CATEGORY_ID"])
@@ -433,7 +433,7 @@ def default_levels_config() -> dict:
         "xp_max": 20,
         "cooldown": 45,
         "announce": True,
-        "announce_mode": "same_channel",  # same_channel | channel | dm
+        "announce_mode": "same_channel",  
         "announce_channel_id": None,
         "announce_message": DEFAULT_ANNOUNCE_MESSAGE,
         "stack_roles": True,
@@ -547,7 +547,7 @@ def find_ticket_entry(query: str, guild_id: Optional[int] = None) -> tuple:
     guilds = [guild_id] if guild_id else [g.id for g in bot.guilds]
     for gid in guilds:
         tickets = get_tickets(gid)
-        # par ID ticket
+       
         for ukey, data in tickets.items():
             if not isinstance(data, dict):
                 continue
@@ -592,7 +592,7 @@ async def close_ticket(user_id: str, closer, channel=None, guild_id: Optional[in
         set_guild(gid)
     tickets = get_tickets(gid)
     if user_id not in tickets:
-        # fallback : chercher partout
+        
         ukey, data, found_gid = find_ticket_entry(str(user_id), None)
         if not ukey:
             return False
@@ -603,7 +603,7 @@ async def close_ticket(user_id: str, closer, channel=None, guild_id: Optional[in
     tickets[user_id]["closed"] = True
     tickets[user_id]["closed_at"] = discord.utils.utcnow().isoformat()
     tickets[user_id]["closed_by"] = getattr(closer, "id", None)
-    # garde l'historique pour +reopen
+    
     save_tickets(tickets, gid)
     try:
         user = await bot.fetch_user(int(data.get("user_id") or user_id))
@@ -778,7 +778,7 @@ async def owner_check(ctx: commands.Context) -> bool:
         except Exception:
             pass
         return False
-    # anti-spam commandes owners (évite double déclenchement abusif)
+   
     key = ctx.author.id
     now = time.time()
     if now - CMD_COOLDOWN.get(key, 0) < 0.35:
@@ -1750,7 +1750,7 @@ class TicketView(discord.ui.View):
         except Exception:
             pass
 
-        # Ajoute le claimer SANS retirer owners / staff
+       
         try:
             await interaction.channel.set_permissions(
                 interaction.user,
@@ -1773,7 +1773,7 @@ class TicketView(discord.ui.View):
             set_guild(gid)
         tickets = get_tickets(gid)
         if self.user_id not in tickets:
-            # fallback recherche
+          
             ukey, data, found = find_ticket_entry(self.user_id, gid)
             if not ukey:
                 await interaction.response.send_message("❌ Ticket introuvable.", ephemeral=True)
@@ -1912,7 +1912,6 @@ async def on_ready():
     print("  ────────────────────────────────────────")
     print(f"  Commandes : {len(cmds)}")
     print(f"  Serveurs  : {len(bot.guilds)}")
-    print(f"  Ping      : {round(bot.latency * 1000)} ms")
     print(f"  Propriétaires : {len(get_owners())}")
     print("  ────────────────────────────────────────\n")
     print(f"  Ready : {bot.user} — {len(cmds)} commandes")
@@ -2036,7 +2035,7 @@ def record_error(kind: str, title: str, detail: str, extra: dict = None):
     data.append(row)
     save_json(ERRORS_FILE, data[-150:])
     print(f"[ERR {kind}] {title}: {detail[:200]}")
-    # Sauvegarde détaillée automatique
+ 
     try:
         os.makedirs(ERROR_DUMP_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2044,7 +2043,7 @@ def record_error(kind: str, title: str, detail: str, extra: dict = None):
         path = os.path.join(ERROR_DUMP_DIR, f"{stamp}_{kind}_{safe}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(row, f, ensure_ascii=False, indent=2)
-        # garde 80 dumps max
+     
         dumps = sorted(
             [os.path.join(ERROR_DUMP_DIR, x) for x in os.listdir(ERROR_DUMP_DIR) if x.endswith(".json")],
             key=os.path.getmtime,
@@ -2113,7 +2112,7 @@ def run_system_diagnostics() -> dict:
         "ping_ms": round(bot.latency * 1000) if bot.is_ready() else None,
         "file": None,
     }
-    # Fichier détaillé automatique
+
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         report_dir = os.path.join(DATA_DIR, "diagnostics")

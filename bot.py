@@ -10,6 +10,7 @@ import sqlite3
 import hashlib
 import secrets
 import hmac
+import subprocess
 from collections import deque
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv()
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -37,7 +38,7 @@ UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # secondes
 
 START_TIME = time.time()
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "1.1.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -3194,24 +3195,51 @@ async def debug_cmd(ctx: commands.Context):
         embed.add_field(name="KO", value="\n".join(bad[:15]), inline=False)
     await status.edit(content=None, embed=embed)
 
+UPDATE_STATE_FILE = os.path.join(DATA_DIR, "update_state.json")
+UPDATE_HTTP_HEADERS = {
+    "User-Agent": f"CoreBot/{BOT_VERSION}",
+    "Accept": "text/plain,application/octet-stream,*/*",
+}
+
 def parse_version(v: str) -> tuple:
     parts = []
-    for p in re.findall(r"\d+", str(v or "0")):
+    for p in re.findall(r"\d+", str(v or "0").lstrip("\ufeff")):
         parts.append(int(p))
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts[:4])
 
+def load_update_state() -> dict:
+    return load_json(UPDATE_STATE_FILE, {"notified": [], "pending": None, "last_ok": None})
+
+def save_update_state(data: dict):
+    save_json(UPDATE_STATE_FILE, data)
+
+def mark_version_notified(remote: str):
+    st = load_update_state()
+    notified = list(st.get("notified") or [])
+    if remote not in notified:
+        notified.append(remote)
+    st["notified"] = notified[-20:]
+    save_update_state(st)
+
+def is_version_notified(remote: str) -> bool:
+    st = load_update_state()
+    return remote in (st.get("notified") or [])
+
 async def fetch_remote_version() -> Optional[str]:
     if not UPDATE_VERSION_URL:
         return None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(UPDATE_VERSION_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with aiohttp.ClientSession(headers=UPDATE_HTTP_HEADERS) as session:
+            async with session.get(UPDATE_VERSION_URL, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
+                    record_error("update", "fetch_version", f"HTTP {resp.status}")
                     return None
-                text = (await resp.text()).strip().splitlines()[0].strip()
-                return text or None
+                text = (await resp.text()).lstrip("\ufeff").strip()
+                if not text:
+                    return None
+                return text.splitlines()[0].strip()
     except Exception as e:
         record_error("update", "fetch_version", str(e))
         return None
@@ -3221,8 +3249,8 @@ async def download_bot_update() -> tuple:
     if not UPDATE_CODE_URL:
         return False, "UPDATE_CODE_URL non défini dans le .env"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(UPDATE_CODE_URL, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        async with aiohttp.ClientSession(headers=UPDATE_HTTP_HEADERS) as session:
+            async with session.get(UPDATE_CODE_URL, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 if resp.status == 404:
                     return False, "Fichier introuvable (404) — vérifie UPDATE_CODE_URL"
                 if resp.status == 403:
@@ -3232,31 +3260,44 @@ async def download_bot_update() -> tuple:
                 data = await resp.read()
         if len(data) < 500:
             return False, f"Fichier trop petit ({len(data)} octets)"
-        head = data[:8000].lower()
+        head = data[:12000].lower()
         if b"discord" not in head and b"import" not in head:
             return False, "Contenu invalide (ne ressemble pas à un bot.py)"
-        tmp = BOT_FILE + ".update"
+        # Fichier cible = le bot réellement lancé
+        target = BOT_FILE
+        if not os.path.isfile(target):
+            target = os.path.abspath("bot.py")
+        tmp = target + ".update"
         try:
             with open(tmp, "wb") as f:
                 f.write(data)
         except PermissionError:
-            return False, "Permission refusée (fichier temporaire)"
+            return False, "Permission refusée (ferme le bot / antivirus si le fichier est verrouillé)"
         except OSError as e:
             return False, f"Erreur écriture : {e}"
-        bak = BOT_FILE + ".bak"
+        bak = target + ".bak"
         try:
-            if os.path.exists(BOT_FILE):
-                with open(BOT_FILE, "rb") as src, open(bak, "wb") as dst:
+            if os.path.exists(target):
+                with open(target, "rb") as src, open(bak, "wb") as dst:
                     dst.write(src.read())
         except Exception as e:
             record_error("update", "backup", str(e))
         try:
-            os.replace(tmp, BOT_FILE)
+            # Windows : replace peut échouer si le .py est verrouillé → essai copie
+            try:
+                os.replace(tmp, target)
+            except PermissionError:
+                with open(tmp, "rb") as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
         except Exception as e:
             return False, f"Impossible de remplacer bot.py : {e}"
-        return True, f"OK — {len(data)} octets"
+        return True, f"OK — {len(data)} octets → {target}"
     except asyncio.TimeoutError:
-        msg = "Délai dépassé (timeout 60s)"
+        msg = "Délai dépassé (timeout)"
         record_error("update", "download", msg)
         return False, msg
     except aiohttp.ClientError as e:
@@ -3296,24 +3337,55 @@ async def report_update_error(channel_id: Optional[int], title: str, detail: str
     except Exception:
         pass
 
-UPDATE_NOTIFIED: set = set()
+def restart_bot_process():
+    """Redémarrage fiable (Windows + Linux)."""
+    args = [sys.executable] + sys.argv
+    print(f"[UPDATE] Restart: {args}")
+    # Windows : execv est souvent problématique
+    if os.name == "nt":
+        subprocess.Popen(args, cwd=os.getcwd(), close_fds=True)
+        os._exit(0)
+    else:
+        try:
+            os.execv(sys.executable, args)
+        except Exception:
+            subprocess.Popen(args, cwd=os.getcwd())
+            os._exit(0)
 
-async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str = "update"):
+async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str = "update", remote: str = None):
     print(f"[UPDATE] Application maj ({reason})…")
     ok, detail = await download_bot_update()
     if not ok:
         await report_update_error(channel_id, "téléchargement", detail)
         return False
     print(f"[UPDATE] {detail}")
+    st = load_update_state()
+    st["last_ok"] = {
+        "at": datetime.now().isoformat(),
+        "remote": remote,
+        "detail": detail,
+        "reason": reason,
+    }
+    if remote:
+        notified = list(st.get("notified") or [])
+        if remote not in notified:
+            notified.append(remote)
+        st["notified"] = notified
+        st["pending"] = None
+    save_update_state(st)
     if channel_id:
-        save_json(os.path.join(DATA_DIR, "restart.json"), {"channel_id": channel_id, "by": 0, "reason": reason})
-    await asyncio.sleep(1)
+        save_json(
+            os.path.join(DATA_DIR, "restart.json"),
+            {"channel_id": channel_id, "by": 0, "reason": reason, "remote": remote},
+        )
+    await asyncio.sleep(0.8)
     try:
         await bot.close()
     except Exception as e:
         record_error("update", "close", str(e))
+    await asyncio.sleep(0.3)
     try:
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        restart_bot_process()
     except Exception as e:
         await report_update_error(channel_id, "redémarrage", str(e))
         return False
@@ -3324,6 +3396,7 @@ class UpdateConfirmView(discord.ui.View):
         super().__init__(timeout=300)
         self.remote = remote
         self.channel_id = channel_id
+        self._busy = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not is_owner(interaction.user.id):
@@ -3333,33 +3406,51 @@ class UpdateConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Mettre à jour", style=discord.ButtonStyle.success, emoji="✅")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._busy:
+            await interaction.response.send_message("Mise à jour déjà en cours…", ephemeral=True)
+            return
+        self._busy = True
+        mark_version_notified(self.remote)  # évite de re-proposer pendant le process
         await interaction.response.edit_message(
-            content=f"Mise à jour `{BOT_VERSION}` → `{self.remote}` en cours…\nEn cas d’échec, un message d’erreur sera envoyé ici / dans les logs.",
+            content=(
+                f"⏳ Mise à jour **`{BOT_VERSION}` → `{self.remote}`**…\n"
+                "1. Téléchargement\n2. Remplacement de `bot.py`\n3. Redémarrage\n"
+                "Ne relance pas le bot à la main."
+            ),
             embed=None,
             view=None,
         )
-        UPDATE_NOTIFIED.discard(self.remote)
         ch = self.channel_id or (interaction.channel.id if interaction.channel else None)
-        ok = await apply_update_and_restart(channel_id=ch, reason=f"confirmé {BOT_VERSION}->{self.remote}")
+        ok = await apply_update_and_restart(
+            channel_id=ch,
+            reason=f"confirmé {BOT_VERSION}->{self.remote}",
+            remote=self.remote,
+        )
         if not ok:
+            self._busy = False
             try:
-                await interaction.followup.send("Échec de la mise à jour — vois le message d’erreur / `+errors`.", ephemeral=True)
+                await interaction.followup.send(
+                    "❌ Échec — regarde le message d’erreur ou `+errors`.\n"
+                    "Sous Windows : ferme le terminal et relance `python bot.py` si le fichier a été téléchargé (`bot.py.bak` présent).",
+                    ephemeral=True,
+                )
             except Exception:
                 pass
 
     @discord.ui.button(label="Plus tard", style=discord.ButtonStyle.secondary, emoji="⏳")
     async def later(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Ne marque pas notified → pourra redemander plus tard via +update
         await interaction.response.edit_message(
-            content=f"Maj `{self.remote}` reportée. Tu pourras refaire `+update`.",
+            content=f"Maj `{self.remote}` reportée. Refais `+update` quand tu veux.",
             embed=None,
             view=None,
         )
 
     @discord.ui.button(label="Ignorer cette version", style=discord.ButtonStyle.danger, emoji="✖️")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        UPDATE_NOTIFIED.add(self.remote)
+        mark_version_notified(self.remote)
         await interaction.response.edit_message(
-            content=f"Version `{self.remote}` ignorée jusqu’à la prochaine.",
+            content=f"Version `{self.remote}` ignorée (plus de notif auto pour celle-ci).",
             embed=None,
             view=None,
         )
@@ -3369,7 +3460,6 @@ def update_embed(remote: Optional[str]) -> discord.Embed:
     emb.add_field(name="Version actuelle", value=f"`{BOT_VERSION}`", inline=True)
     emb.add_field(name="Version distante", value=f"`{remote or 'N/A'}`", inline=True)
     emb.add_field(name="Vérif auto", value="ON" if UPDATE_ENABLED else "OFF", inline=True)
-    emb.add_field(name="URL lue", value=f"`{UPDATE_VERSION_URL or 'vide'}`", inline=False)
     if remote and parse_version(remote) > parse_version(BOT_VERSION):
         emb.color = 0x57F287
         emb.description = f"**Nouvelle version disponible**\n`{BOT_VERSION}` → **`{remote}`**\n\nVeux-tu installer la mise à jour ?"
@@ -3380,12 +3470,12 @@ def update_embed(remote: Optional[str]) -> discord.Embed:
     return emb
 
 async def notify_update_available(remote: str):
-    if remote in UPDATE_NOTIFIED:
+    if is_version_notified(remote):
         return
     if not UPDATE_CODE_URL:
         print("[UPDATE] UPDATE_CODE_URL manquant")
         await report_update_error(None, "config", "UPDATE_CODE_URL manquant dans le .env")
-        UPDATE_NOTIFIED.add(remote)
+        mark_version_notified(remote)
         return
     emb = update_embed(remote)
     sent = False
@@ -3401,7 +3491,7 @@ async def notify_update_available(remote: str):
         record_error("update", "notify", str(e))
     if not sent:
         print(f"[UPDATE] Pas de salon logs — maj {remote} visible via +update")
-    UPDATE_NOTIFIED.add(remote)
+    mark_version_notified(remote)
     print(f"[UPDATE] Notification maj {BOT_VERSION} -> {remote} (salon logs)")
 
 @tasks.loop(seconds=max(60, UPDATE_INTERVAL))
@@ -3413,7 +3503,7 @@ async def update_check_loop():
         return
     if parse_version(remote) <= parse_version(BOT_VERSION):
         return
-    if remote in UPDATE_NOTIFIED:
+    if is_version_notified(remote):
         return
     print(f"[UPDATE] Nouvelle version : {remote} (locale {BOT_VERSION}) — demande confirmation")
     await notify_update_available(remote)
@@ -3444,7 +3534,9 @@ async def update_cmd(ctx: commands.Context, action: str = None):
             await ctx.send(f"Déjà à jour (`{BOT_VERSION}`).")
             return
         await ctx.send(f"Téléchargement et redémarrage… (`{BOT_VERSION}` → `{remote or '?'}`)")
-        await apply_update_and_restart(channel_id=ctx.channel.id, reason="manuel")
+        ok = await apply_update_and_restart(channel_id=ctx.channel.id, reason="manuel", remote=remote)
+        if not ok:
+            await ctx.send("Échec — vois `+errors` ou les logs.")
         return
     await ctx.send("`+update` — vérifier et choisir · `+update install` — forcer")
 
@@ -3467,8 +3559,11 @@ async def restart_cmd(ctx: commands.Context):
         except Exception:
             pass
     print(f"Restart demandé par {ctx.author}")
-    await bot.close()
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    try:
+        await bot.close()
+    except Exception:
+        pass
+    restart_bot_process()
 
 class OwnerScopeView(discord.ui.View):
     def __init__(self, author_id: int, target: discord.User):

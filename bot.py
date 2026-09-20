@@ -6,7 +6,7 @@ import random
 import re
 import platform
 import time
-import sqlite3
+import sqlite32
 import hashlib
 import secrets
 import hmac
@@ -34,6 +34,8 @@ BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
 DBRESET_ENABLED = False
 UPDATE_ENABLED = os.getenv("UPDATE_ENABLED", "0").strip() in ("1", "true", "True", "yes")
 UPDATE_AUTO_INSTALL = os.getenv("UPDATE_AUTO_INSTALL", "0").strip() in ("1", "true", "True", "yes")
+# Détecte toute modification du bot.py GitHub (même sans changer version.txt)
+UPDATE_DETECT_HASH = os.getenv("UPDATE_DETECT_HASH", "1").strip() in ("1", "true", "True", "yes")
 UPDATE_VERSION_URL = os.getenv("UPDATE_VERSION_URL", "").strip()
 UPDATE_CODE_URL = os.getenv("UPDATE_CODE_URL", "").strip()
 try:
@@ -3454,8 +3456,12 @@ async def fetch_remote_version() -> Optional[str]:
     if not UPDATE_VERSION_URL:
         return None
     try:
+        # anti-cache GitHub
+        url = UPDATE_VERSION_URL
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}_={int(time.time())}"
         async with aiohttp.ClientSession(headers=UPDATE_HTTP_HEADERS) as session:
-            async with session.get(UPDATE_VERSION_URL, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
                     record_error("update", "fetch_version", f"HTTP {resp.status}")
                     return None
@@ -3466,6 +3472,48 @@ async def fetch_remote_version() -> Optional[str]:
     except Exception as e:
         record_error("update", "fetch_version", str(e))
         return None
+
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def local_bot_hash() -> Optional[str]:
+    try:
+        path = get_bot_target_path()
+        with open(path, "rb") as f:
+            return hash_bytes(f.read())
+    except Exception:
+        return None
+
+async def fetch_remote_bot_hash() -> tuple:
+    """Retourne (hash, size) du bot.py distant ou (None, 0)."""
+    if not UPDATE_CODE_URL:
+        return None, 0
+    try:
+        url = UPDATE_CODE_URL
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}_={int(time.time())}"
+        async with aiohttp.ClientSession(headers=UPDATE_HTTP_HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    return None, 0
+                data = await resp.read()
+        if len(data) < 500:
+            return None, 0
+        return hash_bytes(data), len(data)
+    except Exception as e:
+        record_error("update", "fetch_hash", str(e))
+        return None, 0
+
+async def code_changed_on_github() -> tuple:
+    """
+    True si le bot.py GitHub diffère du fichier local.
+    Retourne (changed: bool, local_h, remote_h).
+    """
+    local_h = local_bot_hash()
+    remote_h, _ = await fetch_remote_bot_hash()
+    if not local_h or not remote_h:
+        return False, local_h, remote_h
+    return local_h != remote_h, local_h, remote_h
 
 def get_bot_target_path() -> str:
     target = BOT_FILE
@@ -3665,6 +3713,12 @@ async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str
         "reason": reason,
         "new_path": new_path,
     }
+    try:
+        if new_path and os.path.isfile(new_path):
+            with open(new_path, "rb") as f:
+                st["last_applied_hash"] = hash_bytes(f.read())
+    except Exception:
+        pass
     if remote:
         notified = list(st.get("notified") or [])
         if remote not in notified:
@@ -3808,51 +3862,85 @@ async def notify_update_available(remote: str):
 
 @tasks.loop(seconds=5)
 async def update_check_loop():
-    """Scan GitHub : ne redémarre QUE si version distante > version locale."""
-    if not UPDATE_ENABLED or not UPDATE_VERSION_URL:
+    """
+    Scan GitHub :
+    - version.txt plus récente → maj
+    - OU hash du bot.py différent (modification du code) → maj
+    Ne redémarre que s'il y a un vrai changement.
+    """
+    if not UPDATE_ENABLED:
         return
-    # Respecte UPDATE_INTERVAL (défaut 300, min 5)
+    if not UPDATE_VERSION_URL and not UPDATE_CODE_URL:
+        return
     now = time.time()
     last = getattr(update_check_loop, "_last_check", 0)
     if now - last < UPDATE_INTERVAL:
         return
     update_check_loop._last_check = now
 
-    remote = await fetch_remote_version()
-    if not remote:
-        return
-    # Pas de maj → rien (pas de restart)
-    if parse_version(remote) <= parse_version(BOT_VERSION):
+    remote = await fetch_remote_version() if UPDATE_VERSION_URL else None
+    version_newer = bool(remote and parse_version(remote) > parse_version(BOT_VERSION))
+
+    hash_changed = False
+    local_h = remote_h = None
+    if UPDATE_DETECT_HASH and UPDATE_CODE_URL:
+        hash_changed, local_h, remote_h = await code_changed_on_github()
+        # évite de re-proposer le même hash déjà installé / ignoré
+        st = load_update_state()
+        if hash_changed and remote_h and remote_h == st.get("last_applied_hash"):
+            hash_changed = False
+        if hash_changed and remote_h and remote_h in (st.get("ignored_hashes") or []):
+            hash_changed = False
+
+    if not version_newer and not hash_changed:
         return
 
+    label = remote or BOT_VERSION
+    if hash_changed and not version_newer:
+        label = f"{BOT_VERSION}+hash"
+        print(f"[UPDATE] Code GitHub modifié (hash {str(local_h)[:8]}… → {str(remote_h)[:8]}…)")
+    else:
+        print(f"[UPDATE] Version distante {remote} > locale {BOT_VERSION}")
+
     if UPDATE_AUTO_INSTALL and UPDATE_CODE_URL:
-        if is_version_notified(remote):
+        notify_key = remote if version_newer else f"hash:{remote_h}"
+        if is_version_notified(notify_key):
             return
-        mark_version_notified(remote)
-        print(f"[UPDATE] AUTO-INSTALL {BOT_VERSION} → {remote}")
+        mark_version_notified(notify_key)
+        print(f"[UPDATE] AUTO-INSTALL ({label})")
         try:
             cfg = get_config()
             ch_id = cfg.get("LOG_CHANNEL_ID")
             if ch_id:
                 ch = bot.get_channel(int(ch_id))
                 if ch:
-                    await ch.send(
-                        embed=discord.Embed(
-                            title="Mise à jour automatique",
-                            description=f"`{BOT_VERSION}` → **`{remote}`**\nTéléchargement et redémarrage…",
-                            color=0x57F287,
-                            timestamp=discord.utils.utcnow(),
-                        )
-                    )
+                    desc = f"`{BOT_VERSION}` → **`{remote or 'code modifié'}`**\n"
+                    if hash_changed:
+                        desc += f"Hash : `{str(local_h)[:10]}` → `{str(remote_h)[:10]}`\n"
+                    desc += "Téléchargement et redémarrage…"
+                    await ch.send(embed=discord.Embed(
+                        title="Mise à jour automatique",
+                        description=desc,
+                        color=0x57F287,
+                        timestamp=discord.utils.utcnow(),
+                    ))
         except Exception:
             pass
-        await apply_update_and_restart(reason=f"auto {BOT_VERSION}->{remote}", remote=remote)
+        ok = await apply_update_and_restart(
+            reason=f"auto {label}",
+            remote=remote or label,
+        )
+        if ok and remote_h:
+            st = load_update_state()
+            st["last_applied_hash"] = remote_h
+            save_update_state(st)
         return
 
-    if is_version_notified(remote):
+    notify_key = remote if version_newer else f"hash:{remote_h}"
+    if is_version_notified(notify_key):
         return
-    print(f"[UPDATE] Nouvelle version : {remote} (locale {BOT_VERSION}) — demande confirmation")
-    await notify_update_available(remote)
+    print(f"[UPDATE] Changement détecté ({label}) — confirmation")
+    await notify_update_available(remote or label)
 
 @update_check_loop.before_loop
 async def update_check_before():

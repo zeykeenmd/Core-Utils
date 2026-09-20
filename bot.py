@@ -4653,7 +4653,6 @@ async def renew_cmd(ctx: commands.Context):
         await ctx.send("❌ Salon textuel uniquement.")
         return
     try:
-        new_channel = await channel.clone(name=channel.name, reason=f"Renew par {ctx.author}")
         await new_channel.edit(position=channel.position, topic=channel.topic, nsfw=channel.nsfw, slowmode_delay=channel.slowmode_delay)
         await channel.delete(reason="Renew")
     except discord.Forbidden:

@@ -1899,7 +1899,7 @@ async def on_ready():
         ("Propriétaire", ["owner", "unowner", "help", "debug", "restart", "status", "servers"]),
         ("Modération", ["kick", "ban", "unban", "mute", "unmute", "bl", "unbl"]),
         ("Serveur", ["setup", "welcome", "boost", "annonce", "nuke", "giverole"]),
-        ("Tickets", ["ticket", "claim", "add", "remove", "close", "reopen"]),
+        ("Tickets", ["ticket", "claim", "add", "remove"]),
         ("Niveaux", ["levels", "rank", "top", "addxp"]),
     ]
     loaded = 0
@@ -3475,13 +3475,25 @@ async def fetch_remote_version() -> Optional[str]:
                 text = (await resp.text()).lstrip("\ufeff").strip()
                 if not text:
                     return None
-                return text.splitlines()[0].strip()
+                # première ligne non vide, sans espaces parasites
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        return line
+                return None
     except Exception as e:
         record_error("update", "fetch_version", str(e))
         return None
 
+def normalize_code_bytes(data: bytes) -> bytes:
+    """Ignore CRLF/LF et BOM pour comparer le vrai contenu."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return text.encode("utf-8")
+
 def hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(normalize_code_bytes(data)).hexdigest()
 
 def local_bot_hash() -> Optional[str]:
     try:
@@ -3512,10 +3524,7 @@ async def fetch_remote_bot_hash() -> tuple:
         return None, 0
 
 async def code_changed_on_github() -> tuple:
-    """
-    True si le bot.py GitHub diffère du fichier local.
-    Retourne (changed: bool, local_h, remote_h).
-    """
+    """True si le bot.py GitHub diffère du local (hors fins de ligne)."""
     local_h = local_bot_hash()
     remote_h, _ = await fetch_remote_bot_hash()
     if not local_h or not remote_h:
@@ -3635,10 +3644,11 @@ def get_bot_target_path() -> str:
     return target
 
 def extract_version_from_bytes(data: bytes) -> Optional[str]:
+    """Assignation réelle en début de ligne uniquement (ignore le texte dans les messages)."""
     try:
         text = data.decode("utf-8", errors="ignore")
-        m = re.search(r'BOT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-        return m.group(1) if m else None
+        m = re.search(r'(?m)^BOT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+        return m.group(1).strip() if m else None
     except Exception:
         return None
 
@@ -3802,11 +3812,65 @@ def restart_bot_process():
         subprocess.Popen(args, cwd=os.getcwd())
         os._exit(0)
 
+async def log_github_transfer(
+    *,
+    remote: Optional[str],
+    file_ver: Optional[str],
+    detail: str,
+    reason: str,
+    new_path: Optional[str] = None,
+    success: bool = True,
+    error: str = None,
+):
+    """Log salon + webhooks nommés github / update / logs pour les transferts GitHub."""
+    emb = discord.Embed(
+        title="Transfert GitHub" if success else "Échec transfert GitHub",
+        color=0x57F287 if success else 0xED4245,
+        timestamp=discord.utils.utcnow(),
+    )
+    emb.add_field(name="Version locale", value=f"`{BOT_VERSION}`", inline=True)
+    emb.add_field(name="Version distante", value=f"`{remote or '—'}`", inline=True)
+    emb.add_field(name="BOT_VERSION fichier", value=f"`{file_ver or '—'}`", inline=True)
+    emb.add_field(name="Raison", value=f"`{reason}`", inline=True)
+    emb.add_field(name="Détail", value=f"```{(detail or error or '')[:800]}```", inline=False)
+    if new_path:
+        emb.add_field(name="Fichier", value=f"`{new_path}`", inline=False)
+    emb.set_footer(text="Core · sync GitHub → bot.py")
+
+    # Salon logs Discord
+    try:
+        await send_log(emb)
+    except Exception:
+        pass
+
+    # Webhooks enregistrés (+webhook) : noms ciblés ou tous si UPDATE_WEBHOOK_ALL
+    hooks = load_json(WEBHOOKS_FILE, {})
+    if not isinstance(hooks, dict):
+        return
+    names = {"github", "update", "updates", "logs", "log", "core"}
+    payload = {"embeds": [emb.to_dict()]}
+    async with aiohttp.ClientSession() as session:
+        for name, h in hooks.items():
+            if name.lower() not in names and not os.getenv("UPDATE_WEBHOOK_ALL", "").strip() in ("1", "true", "yes"):
+                continue
+            url = (h or {}).get("url")
+            if not url:
+                continue
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status >= 300:
+                        print(f"[UPDATE] webhook {name} HTTP {resp.status}")
+            except Exception as e:
+                print(f"[UPDATE] webhook {name}: {e}")
+
 async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str = "update", remote: str = None):
     print(f"[UPDATE] Application maj ({reason})…")
     ok, detail, new_path, file_ver = await download_bot_update()
     if not ok:
         await report_update_error(channel_id, "téléchargement", detail)
+        await log_github_transfer(
+            remote=remote, file_ver=file_ver, detail=detail, reason=reason, success=False, error=detail
+        )
         return False
     print(f"[UPDATE] {detail}")
     if remote and file_ver and parse_version(file_ver) < parse_version(remote):
@@ -3816,6 +3880,10 @@ async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str
         )
         print(f"[UPDATE] {warn}")
         await report_update_error(channel_id, "version fichier", warn)
+
+    await log_github_transfer(
+        remote=remote, file_ver=file_ver, detail=detail, reason=reason, new_path=new_path, success=True
+    )
 
     st = load_update_state()
     st["last_ok"] = {
@@ -3850,9 +3918,11 @@ async def apply_update_and_restart(channel_id: Optional[int] = None, reason: str
         write_and_launch_updater(new_path, target)
     except Exception as e:
         await report_update_error(channel_id, "updater", str(e))
+        await log_github_transfer(
+            remote=remote, file_ver=file_ver, detail=str(e), reason=reason, success=False, error=str(e)
+        )
         return False
 
-    # Message console clair
     print("[UPDATE] Le script d'update va remplacer bot.py puis relancer le bot dans ~3s.")
     await asyncio.sleep(0.5)
     try:
@@ -4007,17 +4077,23 @@ async def update_check_loop():
 
     remote = await fetch_remote_version() if UPDATE_VERSION_URL else None
     version_newer = bool(remote and parse_version(remote) > parse_version(BOT_VERSION))
+    # Local en avance sur GitHub → ne pas "mettre à jour" vers une version plus vieille
+    local_ahead = bool(remote and parse_version(remote) < parse_version(BOT_VERSION))
 
     hash_changed = False
     local_h = remote_h = None
-    if UPDATE_DETECT_HASH and UPDATE_CODE_URL:
+    if UPDATE_DETECT_HASH and UPDATE_CODE_URL and not local_ahead:
         hash_changed, local_h, remote_h = await code_changed_on_github()
-        # évite de re-proposer le même hash déjà installé / ignoré
         st = load_update_state()
         if hash_changed and remote_h and remote_h == st.get("last_applied_hash"):
             hash_changed = False
         if hash_changed and remote_h and remote_h in (st.get("ignored_hashes") or []):
             hash_changed = False
+        # Même numéro de version + hash différent seulement
+        if hash_changed and remote and parse_version(remote) != parse_version(BOT_VERSION):
+            # versions différentes déjà gérées par version_newer / local_ahead
+            if not version_newer:
+                hash_changed = False
 
     if not version_newer and not hash_changed:
         return
@@ -4090,10 +4166,13 @@ async def update_cmd(ctx: commands.Context, action: str = None):
                     local_text = f.read()
                 remote_text = await fetch_remote_bot_text()
                 if remote_text:
-                    hash_changed = hash_bytes(local_text.encode("utf-8", errors="replace")) != hash_bytes(
-                        remote_text.encode("utf-8", errors="replace")
-                    )
-                    changelog = analyze_code_changes(local_text, remote_text)
+                    local_n = local_text.replace("\r\n", "\n").replace("\r", "\n")
+                    remote_n = remote_text.replace("\r\n", "\n").replace("\r", "\n")
+                    hash_changed = hash_bytes(local_n.encode("utf-8")) != hash_bytes(remote_n.encode("utf-8"))
+                    # Ne pas signaler de maj si le local est plus récent que GitHub
+                    if remote and parse_version(remote) < parse_version(BOT_VERSION):
+                        hash_changed = False
+                    changelog = analyze_code_changes(local_n, remote_n)
             except Exception as e:
                 record_error("update", "changelog", str(e))
         emb = update_embed(remote, changelog=changelog, hash_changed=hash_changed)
@@ -6785,7 +6864,14 @@ HELP_CATS = {
     "proprio": ("Propriétaire", "`+owner` `+owner @user` `+unowner` `+owner reset`\n`+ownerplus` `+debug` `+restart` `+status` `+servers`\n`+botprofile` `+serverprofile` `+resetsetup`"),
     "modo": ("Modération", "`+kick` `+ban` `+unban` `+unbanall` `+mute`\n`+bl` `+derank` `+lockall` `+slowmode` `+vockick` `+vocmove`"),
     "serveur": ("Serveur", "`+setup` `+rchannel` `+chdelete` `+allban` `+allrole`\n`+bl-voice` `+lockall` `+giverole` `+perms`"),
-    "tickets": ("Tickets", "MP le bot · boutons Claim / Fermer\n`+giveclaim @staff` `+add` `+remove`"),
+    "tickets": (
+        "Tickets",
+        "MP le bot · boutons Claim / Fermer\n"
+        "`+close` · `+close T-XXXX` — fermer un ticket\n"
+        "`+reopen T-XXXX` — réouvrir un ticket\n"
+        "`+ticketinfo T-XXXX` — infos ticket\n"
+        "`+giveclaim @staff` · `+add` · `+remove`",
+    ),
     "niveaux": ("Niveaux", "`+levels` `+rank` `+rankstyle` `+top`\n`+adminxp` `+adminremovexp`"),
     "auto": ("Auto", "`+custom` `+automsg` `+autoreact` `+automod` `+anniv` `+suggest`"),
     "fun": ("Jeux & fun", "`+pendu` `+bingo` `+morpion` `+quiz` `+pfc`\n`+coreguess` `+corememory` `+coreduel` `+corequiz` `+coreflip`\n`+2048` `+findemoji` `+snake`"),

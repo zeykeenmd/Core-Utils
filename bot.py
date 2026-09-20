@@ -44,7 +44,7 @@ except Exception:
     UPDATE_INTERVAL = 300
 
 START_TIME = time.time()
-BOT_VERSION = "2.1.1"
+BOT_VERSION = "2.1.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -2945,19 +2945,26 @@ async def on_message(message: discord.Message):
     if message.guild:
         set_guild(message.guild.id)
         tickets = get_tickets(message.guild.id)
+        # Les commandes (+close, +reopen, etc.) doivent TOUJOURS passer
+        is_cmd = message.content.startswith("+") or message.content.startswith(str(bot.command_prefix))
         for tid, data in tickets.items():
             if data.get("closed"):
                 continue
             if data.get("channel_id") == message.channel.id:
+                if is_cmd:
+                    break  # laisse process_commands gérer +close / +add / etc.
+
                 claimed_by = data.get("claimed_by")
-                staff_list = data.get("staff", [])
+                staff_list = [int(x) for x in (data.get("staff") or [])]
+                try:
+                    claimed_by_i = int(claimed_by) if claimed_by else None
+                except Exception:
+                    claimed_by_i = claimed_by
 
-                # Si le ticket est claim, seul le staff autorisé peut parler
-                if claimed_by and message.author.id not in staff_list and message.author.id != claimed_by:
-                    return
-
-                if message.content.startswith("+"):
-                    break
+                # Owners toujours autorisés ; si claim → claimer/staff seulement
+                if claimed_by_i and not is_owner(message.author.id):
+                    if message.author.id not in staff_list and message.author.id != claimed_by_i:
+                        return
 
                 try:
                     user = await bot.fetch_user(int(tid))
@@ -2966,7 +2973,7 @@ async def on_message(message: discord.Message):
                         "content": f"**{message.author.display_name}** : {message.content}",
                         "timestamp": discord.utils.utcnow().isoformat()
                     })
-                    save_tickets(tickets)
+                    save_tickets(tickets, message.guild.id)
                 except Exception:
                     await message.channel.send("❌ Impossible d'envoyer le MP à l'utilisateur.", delete_after=5)
                 return
@@ -3515,6 +3522,112 @@ async def code_changed_on_github() -> tuple:
         return False, local_h, remote_h
     return local_h != remote_h, local_h, remote_h
 
+def _extract_symbols(text: str) -> set:
+    """Commandes et fonctions définies dans le code."""
+    names = set()
+    for m in re.finditer(r'@bot\.(?:command|tree\.command|hybrid_command)\s*\(\s*name\s*=\s*["\']([^"\']+)["\']', text):
+        names.add(f"+{m.group(1)}")
+    for m in re.finditer(r'@bot\.tree\.command\s*\(\s*name\s*=\s*["\']([^"\']+)["\']', text):
+        names.add(f"/{m.group(1)}")
+    for m in re.finditer(r'^async def ([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', text, re.M):
+        n = m.group(1)
+        if not n.startswith("_") and not n.endswith("_cmd"):
+            continue
+        if n.endswith("_cmd"):
+            names.add(n)
+    for m in re.finditer(r'^def ([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', text, re.M):
+        n = m.group(1)
+        if n.startswith("get_") or n.startswith("save_") or n.startswith("load_"):
+            names.add(n)
+    return names
+
+def analyze_code_changes(local_text: str, remote_text: str) -> dict:
+    """
+    Résumé : ajouts / retraits / corrections entre local et distant.
+    """
+    import difflib
+    local_lines = local_text.splitlines()
+    remote_lines = remote_text.splitlines()
+    added_lines = 0
+    removed_lines = 0
+    changed_hunks = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, local_lines, remote_lines).get_opcodes():
+        if tag == "insert":
+            added_lines += (j2 - j1)
+        elif tag == "delete":
+            removed_lines += (i2 - i1)
+        elif tag == "replace":
+            changed_hunks += 1
+            added_lines += (j2 - j1)
+            removed_lines += (i2 - i1)
+
+    local_sym = _extract_symbols(local_text)
+    remote_sym = _extract_symbols(remote_text)
+    ajouts = sorted(remote_sym - local_sym)
+    retraits = sorted(local_sym - remote_sym)
+    # corrections = symboles présents des deux côtés mais lignes modifiées autour — approx via replace count
+    corrections = []
+    if changed_hunks:
+        corrections.append(f"{changed_hunks} zone(s) de code modifiée(s)")
+    # BOT_VERSION change
+    lv = re.search(r'BOT_VERSION\s*=\s*["\']([^"\']+)["\']', local_text)
+    rv = re.search(r'BOT_VERSION\s*=\s*["\']([^"\']+)["\']', remote_text)
+    if lv and rv and lv.group(1) != rv.group(1):
+        corrections.insert(0, f"Version `{lv.group(1)}` → `{rv.group(1)}`")
+
+    return {
+        "ajouts": ajouts[:25],
+        "retraits": retraits[:25],
+        "corrections": corrections[:15],
+        "lignes_ajoutees": added_lines,
+        "lignes_retirees": removed_lines,
+        "hunks": changed_hunks,
+    }
+
+async def fetch_remote_bot_text() -> Optional[str]:
+    if not UPDATE_CODE_URL:
+        return None
+    try:
+        url = UPDATE_CODE_URL
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}_={int(time.time())}"
+        async with aiohttp.ClientSession(headers=UPDATE_HTTP_HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception as e:
+        record_error("update", "fetch_text", str(e))
+        return None
+
+def format_changelog(diff: dict) -> str:
+    parts = []
+    aj = diff.get("ajouts") or []
+    re = diff.get("retraits") or []
+    co = diff.get("corrections") or []
+    if aj:
+        parts.append("**➕ Ajouts**\n" + "\n".join(f"• `{x}`" for x in aj[:15]))
+        if len(aj) > 15:
+            parts[-1] += f"\n• … +{len(aj)-15}"
+    else:
+        parts.append("**➕ Ajouts**\n• *aucun*")
+    if re:
+        parts.append("**➖ Retraits**\n" + "\n".join(f"• `{x}`" for x in re[:15]))
+        if len(re) > 15:
+            parts[-1] += f"\n• … +{len(re)-15}"
+    else:
+        parts.append("**➖ Retraits**\n• *aucun*")
+    if co:
+        parts.append("**🔧 Corrections**\n" + "\n".join(f"• {x}" for x in co[:12]))
+    else:
+        la, lr = diff.get("lignes_ajoutees", 0), diff.get("lignes_retirees", 0)
+        if la or lr:
+            parts.append(f"**🔧 Corrections**\n• ~{la} lignes ajoutées / ~{lr} retirées")
+        else:
+            parts.append("**🔧 Corrections**\n• *aucune*")
+    return "\n\n".join(parts)[:3800]
+
 def get_bot_target_path() -> str:
     target = BOT_FILE
     if not os.path.isfile(target):
@@ -3814,25 +3927,39 @@ class UpdateConfirmView(discord.ui.View):
             view=None,
         )
 
-def update_embed(remote: Optional[str]) -> discord.Embed:
+def update_embed(remote: Optional[str], changelog: Optional[dict] = None, hash_changed: bool = False) -> discord.Embed:
     disk_ver = read_local_file_version()
     emb = discord.Embed(title="Gestion des versions", color=0x5865F2, timestamp=discord.utils.utcnow())
     emb.add_field(name="Version en mémoire", value=f"`{BOT_VERSION}`", inline=True)
     emb.add_field(name="Version sur disque", value=f"`{disk_ver or '?'}`", inline=True)
     emb.add_field(name="Version distante", value=f"`{remote or 'N/A'}`", inline=True)
     emb.add_field(name="Vérif auto", value="ON" if UPDATE_ENABLED else "OFF", inline=True)
-    emb.add_field(name="Fichier", value=f"`{get_bot_target_path()}`", inline=False)
-    if remote and parse_version(remote) > parse_version(BOT_VERSION):
+    emb.add_field(name="Auto-install", value="ON" if UPDATE_AUTO_INSTALL else "OFF", inline=True)
+    emb.add_field(name="Détection hash", value="ON" if UPDATE_DETECT_HASH else "OFF", inline=True)
+
+    newer = bool(remote and parse_version(remote) > parse_version(BOT_VERSION))
+    if newer or hash_changed:
         emb.color = 0x57F287
-        emb.description = (
-            f"**Nouvelle version disponible**\n`{BOT_VERSION}` → **`{remote}`**\n\n"
-            "Clique **Mettre à jour** : une nouvelle fenêtre va s’ouvrir, remplacer `bot.py` et relancer le bot.\n"
-            f"⚠️ Le `bot.py` GitHub doit contenir `BOT_VERSION = \"{remote}\"` sinon tu resteras sur l’ancienne version affichée."
-        )
+        if newer:
+            emb.description = f"**Nouvelle version disponible**\n`{BOT_VERSION}` → **`{remote}`**"
+        else:
+            emb.description = f"**Modifications détectées sur GitHub** (même version `{BOT_VERSION}`)"
+        emb.description += "\nClique **Mettre à jour** pour télécharger et redémarrer."
     elif remote:
-        emb.description = "Le bot est **à jour**."
+        emb.description = "Le bot est **à jour** (version + code)."
     else:
         emb.description = "Impossible de lire la version distante (URL / réseau)."
+
+    if changelog:
+        emb.add_field(
+            name="Changements (local → GitHub)",
+            value=format_changelog(changelog)[:1020] or "*aucun détail*",
+            inline=False,
+        )
+        stats = f"+{changelog.get('lignes_ajoutees', 0)} / -{changelog.get('lignes_retirees', 0)} lignes"
+        emb.set_footer(text=f"{stats} · {get_bot_target_path()}")
+    else:
+        emb.set_footer(text=str(get_bot_target_path()))
     return emb
 
 async def notify_update_available(remote: str):
@@ -3952,27 +4079,45 @@ async def update_cmd(ctx: commands.Context, action: str = None):
         return
     action = (action or "check").lower()
     if action in ("status", "info", "check", ""):
+        status = await ctx.send("Analyse des différences avec GitHub…")
         remote = await fetch_remote_version() if UPDATE_VERSION_URL else None
-        emb = update_embed(remote)
-        if remote and parse_version(remote) > parse_version(BOT_VERSION) and UPDATE_CODE_URL:
-            await ctx.send(embed=emb, view=UpdateConfirmView(remote, channel_id=ctx.channel.id))
+        changelog = None
+        hash_changed = False
+        if UPDATE_CODE_URL:
+            try:
+                local_path = get_bot_target_path()
+                with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                    local_text = f.read()
+                remote_text = await fetch_remote_bot_text()
+                if remote_text:
+                    hash_changed = hash_bytes(local_text.encode("utf-8", errors="replace")) != hash_bytes(
+                        remote_text.encode("utf-8", errors="replace")
+                    )
+                    changelog = analyze_code_changes(local_text, remote_text)
+            except Exception as e:
+                record_error("update", "changelog", str(e))
+        emb = update_embed(remote, changelog=changelog, hash_changed=hash_changed)
+        newer = bool(remote and parse_version(remote) > parse_version(BOT_VERSION))
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if (newer or hash_changed) and UPDATE_CODE_URL:
+            await ctx.send(embed=emb, view=UpdateConfirmView(remote or BOT_VERSION, channel_id=ctx.channel.id))
         else:
             await ctx.send(embed=emb)
         return
     if action in ("install", "apply", "now", "yes"):
-        if not UPDATE_CODE_URL or not UPDATE_VERSION_URL:
-            await ctx.send("Configure `UPDATE_VERSION_URL` et `UPDATE_CODE_URL` dans le `.env`.")
+        if not UPDATE_CODE_URL:
+            await ctx.send("Configure `UPDATE_CODE_URL` dans le `.env`.")
             return
-        remote = await fetch_remote_version()
-        if remote and parse_version(remote) <= parse_version(BOT_VERSION):
-            await ctx.send(f"Déjà à jour (`{BOT_VERSION}`).")
-            return
-        await ctx.send(f"Téléchargement et redémarrage… (`{BOT_VERSION}` → `{remote or '?'}`)")
+        remote = await fetch_remote_version() if UPDATE_VERSION_URL else None
+        await ctx.send(f"Téléchargement et redémarrage… (`{BOT_VERSION}` → `{remote or 'GitHub'}`)")
         ok = await apply_update_and_restart(channel_id=ctx.channel.id, reason="manuel", remote=remote)
         if not ok:
             await ctx.send("Échec — vois `+errors` ou les logs.")
         return
-    await ctx.send("`+update` — vérifier et choisir · `+update install` — forcer")
+    await ctx.send("`+update` — vérifier + changelog · `+update install` — forcer")
 
 @bot.command(name="restart")
 async def restart_cmd(ctx: commands.Context):

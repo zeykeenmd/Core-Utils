@@ -21,7 +21,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
 
 START_TIME = time.time()
-BOT_VERSION = "2.1.2"
+BOT_VERSION = "3.0.0"
 BOT_CREATOR = "9kr"
 
 LOG_CHANNEL_ID = None

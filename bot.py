@@ -1889,6 +1889,10 @@ class RecruitView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+   await bot.change_presence(
+        status=discord.Status.dnd,
+        activity=discord.CustomActivity(name="MP moi pour du support")
+    )
     cmds = sorted(bot.commands, key=lambda c: c.name)
     total = max(len(cmds), 1)
     print("\n  ────────────────────────────────────────")

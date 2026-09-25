@@ -44,7 +44,7 @@ except Exception:
     UPDATE_INTERVAL = 300
 
 START_TIME = time.time()
-BOT_VERSION = "3.3.0"
+BOT_VERSION = "3.2.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
@@ -4641,14 +4641,17 @@ async def stats_loop():
 
     try:
         if slot == "dnd":
+            # Discord ne permet pas aux bots d'avoir un vrai "statut personnalisé" texte
+            # (discord.CustomActivity n'est utilisable que par des comptes utilisateurs) :
+            # on utilise donc une activité classique, combinée au statut "ne pas déranger".
             await bot.change_presence(
                 status=discord.Status.dnd,
-                activity=discord.CustomActivity(name="Ne pas déranger")
+                activity=discord.Activity(type=discord.ActivityType.watching, name="Ne pas déranger")
             )
         elif slot == "support":
             await bot.change_presence(
                 status=discord.Status.online,
-                activity=discord.CustomActivity(name="MP moi pour du support")
+                activity=discord.Activity(type=discord.ActivityType.watching, name="MP moi pour du support")
             )
         else:
             g = slot

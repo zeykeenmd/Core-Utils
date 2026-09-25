@@ -44,7 +44,7 @@ except Exception:
     UPDATE_INTERVAL = 300
 
 START_TIME = time.time()
-BOT_VERSION = "3.2.0"
+BOT_VERSION = "3.3.0"
 BOT_CREATOR = "9kr"
 try:
     BOT_FILE = os.path.abspath(__file__)
